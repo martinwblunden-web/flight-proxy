@@ -8,20 +8,9 @@ const PORT = process.env.PORT || 3001;
 const DUFFEL_TOKEN = process.env.DUFFEL_TOKEN;
 const DUFFEL_BASE  = "https://api.duffel.com";
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*").split(",").map(o => o.trim());
-app.use(cors({
-  origin: (origin, cb) => {
-    // Allow requests with no origin (e.g. mobile apps, curl, Postman)
-    if (!origin) return cb(null, true);
-    if (allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
-      return cb(null, true);
-    }
-    cb(new Error(`CORS: origin ${origin} not allowed`));
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
+// ── CORS — allow all origins ──────────────────────────────────────────────────
+app.use(cors());
+app.options("*", cors());
 
 app.use(express.json());
 
@@ -163,9 +152,9 @@ app.get("/offer/:id", async (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`\n✈  Flight proxy running on http://localhost:${PORT}`);
-  console.log(`   Health:  GET  http://localhost:${PORT}/health`);
-  console.log(`   Search:  POST http://localhost:${PORT}/search`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`\n✈  Flight proxy running on port ${PORT}`);
+  console.log(`   Health:  GET  /health`);
+  console.log(`   Search:  POST /search`);
   console.log(`   Duffel token: ${DUFFEL_TOKEN ? DUFFEL_TOKEN.slice(0, 20) + "..." : "NOT SET"}\n`);
 });
