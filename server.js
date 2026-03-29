@@ -1,28 +1,31 @@
 require("dotenv").config();
 const express = require("express");
-const cors    = require("cors");
 const fetch   = require("node-fetch");
-
-const app  = express();
-const PORT = process.env.PORT || 3001;
+ 
+const app          = express();
+const PORT         = process.env.PORT || 3001;
 const DUFFEL_TOKEN = process.env.DUFFEL_TOKEN;
 const DUFFEL_BASE  = "https://api.duffel.com";
-
-// ── CORS — allow all origins ──────────────────────────────────────────────────
-app.use(cors());
-app.options("*", cors());
-
+ 
+// ── Bulletproof CORS — set headers on every single response ──────────────────
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin",  "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+ 
 app.use(express.json());
-
-// ── Health check ──────────────────────────────────────────────────────────────
+ 
+// ── Health ────────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
-
-// ── Helper: forward a request to Duffel ──────────────────────────────────────
+ 
+// ── Duffel helper ─────────────────────────────────────────────────────────────
 async function duffelRequest(method, path, body) {
-  const url = `${DUFFEL_BASE}${path}`;
-  const options = {
+  const res = await fetch(`${DUFFEL_BASE}${path}`, {
     method,
     headers: {
       "Content-Type":   "application/json",
@@ -30,84 +33,76 @@ async function duffelRequest(method, path, body) {
       "Duffel-Version": "v2",
       "Authorization":  `Bearer ${DUFFEL_TOKEN}`,
     },
-  };
-  if (body) options.body = JSON.stringify(body);
-
-  const res  = await fetch(url, options);
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
   const json = await res.json();
   return { status: res.status, json };
 }
-
+ 
 // ── POST /search ──────────────────────────────────────────────────────────────
-// Body: { from, to, depDate, retDate?, passengers, cabinClass, preferredAirline? }
 app.post("/search", async (req, res) => {
-  const { from, to, depDate, retDate, passengers = 1, cabinClass = "economy", preferredAirline } = req.body;
-
+  const {
+    from,
+    to,
+    depDate,
+    retDate,
+    passengers      = 1,
+    cabinClass      = "economy",
+    preferredAirline,
+  } = req.body;
+ 
   if (!from || !to || !depDate) {
     return res.status(400).json({ error: "from, to and depDate are required" });
   }
-
-  // Build slices
+ 
   const slices = [{ origin: from, destination: to, departure_date: depDate }];
   if (retDate) slices.push({ origin: to, destination: from, departure_date: retDate });
-
-  // Build passengers
+ 
   const paxArr = Array.from({ length: parseInt(passengers) }, () => ({ type: "adult" }));
-
-  const offerRequestBody = {
-    data: {
-      slices,
-      passengers: paxArr,
-      cabin_class: cabinClass,
-    },
-  };
-
+ 
   try {
-    // 1. Create offer request
     const { status, json } = await duffelRequest(
       "POST",
       "/air/offer_requests?return_offers=true&supplier_timeout=15000",
-      offerRequestBody
+      { data: { slices, passengers: paxArr, cabin_class: cabinClass } }
     );
-
+ 
     if (status !== 201 && status !== 200) {
-      return res.status(status).json({ error: json?.errors?.[0]?.message || "Duffel error", raw: json });
+      return res.status(status).json({
+        error: json?.errors?.[0]?.message || "Duffel API error",
+        raw: json,
+      });
     }
-
+ 
     let offers = json?.data?.offers || [];
-
-    // 2. Filter by preferred airline IATA code
-    const airlineMap = {
+ 
+    // Filter by airline if specified
+    const airlineIataMap = {
       "British Airways":    "BA",
       "Singapore Airlines": "SQ",
       "Emirates":           "EK",
       "Qatar Airways":      "QR",
       "Scoot":              "TR",
     };
-
-    if (preferredAirline && preferredAirline !== "any" && airlineMap[preferredAirline]) {
-      const iata = airlineMap[preferredAirline];
+ 
+    if (preferredAirline && preferredAirline !== "any" && airlineIataMap[preferredAirline]) {
+      const iata = airlineIataMap[preferredAirline];
       offers = offers.filter(o =>
         o.slices?.some(s =>
           s.segments?.some(seg =>
             seg.operating_carrier?.iata_code === iata ||
-            seg.marketing_carrier?.iata_code === iata
+            seg.marketing_carrier?.iata_code  === iata
           )
         )
       );
     }
-
-    // 3. Sort cheapest first, return top 5
+ 
+    // Sort cheapest first, top 5
     offers.sort((a, b) => parseFloat(a.total_amount) - parseFloat(b.total_amount));
-    const top = offers.slice(0, 5);
-
-    // 4. Shape response — only what the frontend needs
-    const shaped = top.map(offer => {
-      const slice  = offer.slices?.[0];
-      const seg    = slice?.segments?.[0];
-      const retSlice = offer.slices?.[1];
-      const retSeg   = retSlice?.segments?.[0];
-
+ 
+    const shaped = offers.slice(0, 5).map(offer => {
+      const seg    = offer.slices?.[0]?.segments?.[0];
+      const retSeg = offer.slices?.[1]?.segments?.[0];
       return {
         id:            offer.id,
         totalAmount:   offer.total_amount,
@@ -122,26 +117,26 @@ app.post("/search", async (req, res) => {
           origin:       seg?.origin?.iata_code,
           destination:  seg?.destination?.iata_code,
           cabinClass:   seg?.passengers?.[0]?.cabin_class_marketing_name,
-          stops:        (slice?.segments?.length || 1) - 1,
+          stops:        (offer.slices?.[0]?.segments?.length || 1) - 1,
         },
         inbound: retSeg ? {
           airline:      retSeg?.marketing_carrier?.name || retSeg?.operating_carrier?.name,
-          flightNumber: retSeg ? `${retSeg.marketing_carrier?.iata_code || ""}${retSeg.marketing_carrier_flight_number || ""}` : null,
+          flightNumber: `${retSeg?.marketing_carrier?.iata_code || ""}${retSeg?.marketing_carrier_flight_number || ""}`,
           departingAt:  retSeg?.departing_at,
           arrivingAt:   retSeg?.arriving_at,
         } : null,
       };
     });
-
+ 
     return res.json({ offers: shaped, total: shaped.length });
-
+ 
   } catch (err) {
     console.error("Proxy error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
-
-// ── GET /offer/:id — fetch a single up-to-date offer before booking ───────────
+ 
+// ── GET /offer/:id ────────────────────────────────────────────────────────────
 app.get("/offer/:id", async (req, res) => {
   try {
     const { status, json } = await duffelRequest("GET", `/air/offers/${req.params.id}`);
@@ -150,11 +145,10 @@ app.get("/offer/:id", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
+ 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n✈  Flight proxy running on port ${PORT}`);
-  console.log(`   Health:  GET  /health`);
-  console.log(`   Search:  POST /search`);
-  console.log(`   Duffel token: ${DUFFEL_TOKEN ? DUFFEL_TOKEN.slice(0, 20) + "..." : "NOT SET"}\n`);
+  console.log(`   Token: ${DUFFEL_TOKEN ? DUFFEL_TOKEN.slice(0, 22) + "..." : "NOT SET"}\n`);
 });
+ 
